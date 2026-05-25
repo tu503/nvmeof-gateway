@@ -22,8 +22,15 @@ spec:
     spec:
       nodeSelector:
         kubernetes.io/hostname: sm3
+      # hostNetwork: SPDK NVMe-oF must bind a locally-assigned IP, and the
+      # initiator's nvme-tcp transport address must match the bind. Sharing
+      # sm3's network namespace lets us bind sm3's 10.144.27.26 directly.
+      # Per-gateway ports differentiate gw-a (4420/5500/8009) from gw-b
+      # (4421/5501/8010) since they share sm3's port space.
+      hostNetwork: true
       hostname: gw-a
       hostIPC: true
+      dnsPolicy: ClusterFirstWithHostNet
       containers:
         - name: gateway
           image: registry.alcg.io/ceph-nvmeof:upstream
@@ -33,20 +40,31 @@ spec:
             capabilities:
               add: ["SYS_ADMIN", "SYS_NICE", "IPC_LOCK"]
           env:
-            - name: GATEWAY_NAME
-              value: gw-a
-            - name: POD_IP
-              valueFrom: { fieldRef: { fieldPath: status.podIP }}
+            - { name: GATEWAY_NAME,   value: gw-a }
+            - { name: GRPC_PORT,      value: "5500" }
+            - { name: DATA_PORT,      value: "4420" }
+            - { name: DISCOVERY_PORT, value: "8009" }
           command: ["/bin/sh","-c"]
           args:
             - |
               set -e
-              sed -e "s/\${GATEWAY_NAME}/$GATEWAY_NAME/g" -e "s/\${POD_IP}/$POD_IP/g" /etc/ceph-nvmeof/ceph-nvmeof.conf.tmpl > /tmp/ceph-nvmeof.conf
-              exec python3 -m control --config /tmp/ceph-nvmeof.conf
+              sed -e "s/\${GATEWAY_NAME}/$GATEWAY_NAME/g" \
+                  -e "s/\${GRPC_PORT}/$GRPC_PORT/g" \
+                  -e "s/\${DISCOVERY_PORT}/$DISCOVERY_PORT/g" \
+                  /etc/ceph-nvmeof/ceph-nvmeof.conf.tmpl > /tmp/ceph-nvmeof.conf
+              # hostNetwork shares sm3's UTS namespace, so both gateway pods
+              # would normally see hostname=sm3 — and ceph-nvmeof routes
+              # listener-adds by gethostname(). Create a private UTS and set
+              # the per-gateway hostname so each pod claims its own identity
+              # (gw-a / gw-b) without touching the host.
+              exec unshare --uts -- sh -c "
+                echo $GATEWAY_NAME > /proc/sys/kernel/hostname
+                exec python3 -m control --config /tmp/ceph-nvmeof.conf
+              "
           ports:
-            - { name: grpc,      containerPort: 5500, protocol: TCP }
-            - { name: nvme-tcp,  containerPort: 4420, protocol: TCP }
-            - { name: discovery, containerPort: 8009, protocol: TCP }
+            - { name: grpc,      containerPort: 5500, hostPort: 5500, protocol: TCP }
+            - { name: nvme-tcp,  containerPort: 4420, hostPort: 4420, protocol: TCP }
+            - { name: discovery, containerPort: 8009, hostPort: 8009, protocol: TCP }
           resources:
             requests:
               cpu: "500m"
