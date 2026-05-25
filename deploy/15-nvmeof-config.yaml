@@ -26,6 +26,11 @@ data:
     max_namespaces = 1024
     max_namespaces_per_subsystem = 256
     max_hosts_per_subsystem = 32
+    # The listener IP we advertise is the MetalLB VIP (10.144.27.22x),
+    # which isn't actually bound on this pod's interface — MetalLB
+    # rewrites externally. Disable the bind-check so the gateway
+    # accepts the advertised IP and binds 0.0.0.0 internally.
+    verify_listener_ip = False
 
     [gateway-logs]
     log_level = INFO
