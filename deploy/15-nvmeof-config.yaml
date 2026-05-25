@@ -31,6 +31,13 @@ data:
     # rewrites externally. Disable the bind-check so the gateway
     # accepts the advertised IP and binds 0.0.0.0 internally.
     verify_listener_ip = False
+    # Don't suicide on transient state-update errors. The gateway-server
+    # default treats any rpc failure (e.g. the other gateway's listener
+    # whose host-name doesn't match) as fatal. With ANA HA both pods see
+    # the same OMAP and process each other's listener entries; the
+    # "host name differs" rejection should log + skip, not abort.
+    abort_on_update_error = False
+    abort_on_errors = False
 
     [gateway-logs]
     log_level = INFO
