@@ -13,7 +13,7 @@ data:
     name = ${GATEWAY_NAME}
     group = rbd-default
     addr = 0.0.0.0
-    port = 5500
+    port = ${GRPC_PORT}
     enable_auth = False
     state_update_notify = True
     state_update_interval_sec = 5
@@ -37,7 +37,7 @@ data:
 
     [discovery]
     addr = 0.0.0.0
-    port = 8009
+    port = ${DISCOVERY_PORT}
 
     [ceph]
     pool = nvmeof
