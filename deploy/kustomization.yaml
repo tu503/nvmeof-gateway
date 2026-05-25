@@ -10,5 +10,8 @@ resources:
   - 11-keyring-gw-b.sealed.yaml
   - 20-deployment-gw-a.yaml
   - 20-deployment-gw-b.yaml
-  - 30-service-gw-a.yaml
-  - 30-service-gw-b.yaml
+# Services removed 2026-05-25: pods are hostNetwork=true and bind sm3
+# directly (10.144.27.26:4420 for gw-a, :4421 for gw-b). The MetalLB
+# LB-VIPs at .224/.225 weren't reachable inside the pod's netns for
+# SPDK's nvme-tcp bind(), so the LoadBalancer indirection was dropped.
+# Initiators target sm3's IP directly via the discovery service.
