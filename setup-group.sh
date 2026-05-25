@@ -65,7 +65,7 @@ ensure_cephx_client() {
   local key
   if ceph auth get "${entity}" &>/dev/null; then
     key=$(ceph auth get-key "${entity}")
-    echo "[=] cephx ${entity} already exists"
+    echo "[=] cephx ${entity} already exists" >&2
     ceph auth caps "${entity}" \
         mon "profile rbd" \
         osd "profile rbd pool=${POOL_STATE}, profile rbd pool=${POOL_DATA}, profile rbd pool=rbd" \
@@ -76,9 +76,10 @@ ensure_cephx_client() {
         osd "profile rbd pool=${POOL_STATE}, profile rbd pool=${POOL_DATA}, profile rbd pool=rbd" \
         mgr "profile rbd" >/dev/null
     key=$(ceph auth get-key "${entity}")
-    echo "[+] created cephx ${entity}"
+    echo "[+] created cephx ${entity}" >&2
   fi
-  echo "${key}"
+  # Only the key bytes go to stdout — caller captures via $(...)
+  printf '%s' "${key}"
 }
 
 seal_keyring() {
@@ -106,14 +107,15 @@ EOF
   echo "[+] wrote ${out}"
 }
 
-ensure_gw_group() {
-  local group=$1 pool=$2
-  if ceph nvmeof gw group ls 2>/dev/null | grep -q "\"${group}\""; then
-    echo "[=] gateway-group ${group} already exists"
+ensure_gw_registered() {
+  local id=$1 pool=$2 group=$3
+  # `ceph nvme-gw show <pool> <group>` lists current members; create if absent.
+  if ceph nvme-gw show "${pool}" "${group}" 2>/dev/null | grep -q "\"${id}\""; then
+    echo "[=] gateway ${id} already registered in (${pool}, ${group})"
   else
-    ceph nvmeof gw group create "${group}" "${pool}" || \
-        { echo "ERROR: ceph nvmeof gw group create failed — is sys-cluster/ceph built with USE=\"nvmeof spdk\"?"; exit 1; }
-    echo "[+] created gateway-group ${group}"
+    ceph nvme-gw create "${id}" "${pool}" "${group}" || \
+        { echo "ERROR: ceph nvme-gw create failed — is sys-cluster/ceph built with USE=\"nvmeof spdk\"?"; exit 1; }
+    echo "[+] registered gateway ${id} in (${pool}, ${group})"
   fi
 }
 
@@ -125,13 +127,15 @@ main() {
   ensure_ec_profile "${EC_PROFILE}"
   ensure_pool_ec "${POOL_DATA}" 32 "${EC_PROFILE}"
 
-  echo "=== Gateway group ==="
-  ensure_gw_group "${GROUP_NAME}" "${POOL_STATE}"
-
   echo "=== Cephx clients + sealed keyrings ==="
   for gw in "${GATEWAYS[@]}"; do
     key=$(ensure_cephx_client "${gw}")
     seal_keyring "${gw}" "${key}"
+  done
+
+  echo "=== Register each gateway in the ANA group ==="
+  for gw in "${GATEWAYS[@]}"; do
+    ensure_gw_registered "${gw}" "${POOL_STATE}" "${GROUP_NAME}"
   done
 
   echo

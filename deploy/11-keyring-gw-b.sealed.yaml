@@ -1,0 +1,14 @@
+---
+apiVersion: bitnami.com/v1alpha1
+kind: SealedSecret
+metadata:
+  name: ceph-nvmeof-keyring-gw-b
+  namespace: nvmeof-gateway
+spec:
+  encryptedData:
+    keyring: AgABJovWU8vm3AGty87ug+417TQhXj+F/TtCKWNuK9quoEdgMLwU7Y6Udrlw1OLFkg/DhT+hZ5AP3ixa9E4q3VHZc3Ydb5UttMFAuNiBT1nceE5O5ygvLpi0lG84z1yF5CFqyDlcfaHkpDt+z1DcBdgNYWA9t8oDE/ZGDCRera/2YJ5IdpQD1gmtHRaztbSSmpZ+TV+9nHzp6dP+jOfHMwZ+KyAweAP4M9kMflxHpK/aReTXEXJaoAMHnCD4QrcrLDDu3dIUcQgxqv5fqMRxeueD8pvuQZUQR+CBwwTdG53jd/1WKIsRLZQsw7mXMwEuKyM1ozj9BU/msR44tTXBPT2RDexUQpT1HQdHu9TsdzAIgycW8nb9ZccjAWQi4228MDgwQCfMRfrP33OnqtVJeLmhVoTx91sirGhAVzwWtRC5iZQjcZBpa4EypnUHYi+S5kHt2J36T3emWH8YViT1tHY+Uvi/Hw4R61JKSfU1i0BKUnTgJRZ9XbDLfatttlIptkRTvwqwwqgCbnYhYM4ofTO0IQFL59zL79GgK3/XLafEDbnao3W6KoizFYaXQtWgDCz15WNZkN/sEanS2p3AB/Gx4Z3IW8kuAL+cRN3/p5DPP5KsuZoc6u9C6wpiZjXWcSXRLq4yj84QtkulFa/vaivFnC+kMXEIqPwhkBSEcGbjtvSnhqfvD4SHeJNRSCRnODwyaIc1TZqfpTUGUxh9O7jJIC1MEMjG2oEiutwvoNvqGxTg9DhDa9MKceNZ9jEHGII2nZqPVn5tjUTD1gzadweaYRw6QA==
+  template:
+    metadata:
+      name: ceph-nvmeof-keyring-gw-b
+      namespace: nvmeof-gateway
+    type: Opaque
