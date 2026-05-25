@@ -1,0 +1,13 @@
+apiVersion: source.toolkit.fluxcd.io/v1
+kind: GitRepository
+metadata:
+  name: nvmeof-gateway
+  namespace: flux-system
+spec:
+  interval: 1m
+  url: ssh://git@gitlab-ssh.alcg.io:22/homelab/infra/nvmeof-gateway.git
+  ref:
+    branch: main
+  secretRef:
+    name: nvmeof-gateway-git-ssh
+  timeout: 60s

@@ -1,0 +1,24 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ceph-config-nvmeof
+  namespace: nvmeof-gateway
+data:
+  ceph.conf: |
+    [global]
+    fsid = f64f9c1f-c1d5-447b-ae97-dfa92dec9bde
+    mon host = 10.144.27.26:6789
+    auth cluster required = cephx
+    auth service required = cephx
+    auth client required = cephx
+
+    # OTLP tracing — same collector used by RGW + OSDs
+    jaeger_tracing_enable = true
+    otel_tracing_endpoint = http://tempo.monitoring.svc:4318/v1/traces
+
+    # ceph-nvmeof gateway tuning (matches upstream container defaults)
+    [client.nvmeof.gw-a]
+    log_file = /var/log/ceph/nvmeof-gw-a.log
+
+    [client.nvmeof.gw-b]
+    log_file = /var/log/ceph/nvmeof-gw-b.log

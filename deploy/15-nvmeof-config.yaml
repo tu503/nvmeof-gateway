@@ -1,0 +1,55 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nvmeof-gateway-config
+  namespace: nvmeof-gateway
+data:
+  # ceph-nvmeof.conf — per-gateway overrides are injected via envsubst
+  # at pod start (GATEWAY_NAME, GATEWAY_GROUP, POD_IP).
+  #
+  # Reference: https://github.com/ceph/ceph-nvmeof/blob/main/ceph-nvmeof.conf
+  ceph-nvmeof.conf.tmpl: |
+    [gateway]
+    name = ${GATEWAY_NAME}
+    group = rbd-default
+    addr = 0.0.0.0
+    port = 5500
+    enable_auth = False
+    state_update_notify = True
+    state_update_interval_sec = 5
+    enable_spdk_discovery_controller = False
+    omap_file_lock_duration = 20
+    omap_file_lock_retries = 30
+    omap_file_lock_retry_sleep_interval = 1.0
+    omap_file_update_reloads = 10
+    max_subsystems = 128
+    max_namespaces = 1024
+    max_namespaces_per_subsystem = 256
+    max_hosts_per_subsystem = 32
+
+    [gateway-logs]
+    log_level = INFO
+
+    [discovery]
+    addr = 0.0.0.0
+    port = 8009
+
+    [ceph]
+    pool = nvmeof
+    config_file = /etc/ceph/ceph.conf
+    id = nvmeof.${GATEWAY_NAME}
+
+    [mtls]
+    server_key = ''
+    client_key = ''
+    server_cert = ''
+    client_cert = ''
+
+    [spdk]
+    tgt_path = /usr/local/bin/nvmf_tgt
+    rpc_socket_dir = /var/tmp/
+    rpc_socket_name = spdk.sock
+    timeout = 60
+    log_level = WARN
+    transports = tcp
+    transport_tcp_options = {"in_capsule_data_size": 8192, "max_io_qpairs_per_ctrlr": 7}

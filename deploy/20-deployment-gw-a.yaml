@@ -1,0 +1,74 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nvmeof-gw-a
+  namespace: nvmeof-gateway
+  labels:
+    app: nvmeof
+    gateway: gw-a
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: nvmeof
+      gateway: gw-a
+  template:
+    metadata:
+      labels:
+        app: nvmeof
+        gateway: gw-a
+    spec:
+      nodeSelector:
+        kubernetes.io/hostname: sm3
+      hostIPC: true
+      containers:
+        - name: gateway
+          image: registry.alcg.io/ceph-nvmeof:v20.1.1
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            privileged: true
+            capabilities:
+              add: ["SYS_ADMIN", "SYS_NICE", "IPC_LOCK"]
+          env:
+            - name: GATEWAY_NAME
+              value: gw-a
+            - name: POD_IP
+              valueFrom: { fieldRef: { fieldPath: status.podIP }}
+          command: ["/bin/sh","-c"]
+          args:
+            - |
+              set -e
+              envsubst < /etc/ceph-nvmeof/ceph-nvmeof.conf.tmpl > /tmp/ceph-nvmeof.conf
+              exec python3 -m control --config /tmp/ceph-nvmeof.conf
+          ports:
+            - { name: grpc,      containerPort: 5500, protocol: TCP }
+            - { name: nvme-tcp,  containerPort: 4420, protocol: TCP }
+            - { name: discovery, containerPort: 8009, protocol: TCP }
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "1Gi"
+              hugepages-2Mi: "1Gi"
+            limits:
+              cpu: "2"
+              memory: "2Gi"
+              hugepages-2Mi: "1Gi"
+          volumeMounts:
+            - { name: ceph-config,    mountPath: /etc/ceph/ceph.conf, subPath: ceph.conf,    readOnly: true }
+            - { name: ceph-keyring,   mountPath: /etc/ceph/keyring,   subPath: keyring,      readOnly: true }
+            - { name: nvmeof-config,  mountPath: /etc/ceph-nvmeof,    readOnly: true }
+            - { name: hugepage,       mountPath: /dev/hugepages }
+            - { name: dshm,           mountPath: /dev/shm }
+      volumes:
+        - name: ceph-config
+          configMap: { name: ceph-config-nvmeof }
+        - name: ceph-keyring
+          secret:    { secretName: ceph-nvmeof-keyring-gw-a }
+        - name: nvmeof-config
+          configMap: { name: nvmeof-gateway-config }
+        - name: hugepage
+          emptyDir:  { medium: HugePages-2Mi }
+        - name: dshm
+          emptyDir:  { medium: Memory }

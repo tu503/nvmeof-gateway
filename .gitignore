@@ -1,0 +1,21 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+.claude/
+*.log
+
+# Never commit plaintext ceph keyrings — only *.sealed.yaml.
+11-keyring-*.yaml
+!11-keyring-*.sealed.yaml
+**/11-keyring-*.yaml
+!**/11-keyring-*.sealed.yaml
+
+# build artifacts staged by build-image.sh
+libs/
+ceph-libs/
+python-bindings/
+gcc-libs/
+*.tar
+*.pre-readtrace
