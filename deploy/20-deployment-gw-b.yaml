@@ -40,7 +40,7 @@ spec:
           args:
             - |
               set -e
-              envsubst < /etc/ceph-nvmeof/ceph-nvmeof.conf.tmpl > /tmp/ceph-nvmeof.conf
+              sed -e "s/\${GATEWAY_NAME}/$GATEWAY_NAME/g" -e "s/\${POD_IP}/$POD_IP/g" /etc/ceph-nvmeof/ceph-nvmeof.conf.tmpl > /tmp/ceph-nvmeof.conf
               exec python3 -m control --config /tmp/ceph-nvmeof.conf
           ports:
             - { name: grpc,      containerPort: 5500, protocol: TCP }
