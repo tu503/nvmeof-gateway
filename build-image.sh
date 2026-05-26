@@ -180,10 +180,18 @@ import re, tomllib
 with open("${NVMEOF_SRC}/pyproject.toml", "rb") as f:
     deps = tomllib.load(f)["project"]["dependencies"]
 out = []
+saw_proto = False
 for d in deps:
     # Relax grpcio/grpcio_tools pins so pip can pick Python 3.13 wheels
     d2 = re.sub(r'^(grpcio(?:_tools)?)\s*~=\s*([\d.]+)', r'\1>=\2', d)
+    # Cap protobuf at <5: ceph-nvmeof 1.6.14 calls MessageToJson with the
+    # including_default_value_fields kwarg that protobuf 5.x removed.
+    if re.match(r'^protobuf\b', d2):
+        d2 = "protobuf<5"
+        saw_proto = True
     out.append(d2)
+if not saw_proto:
+    out.append("protobuf<5")
 print("\n".join(out))
 EOF
 )
