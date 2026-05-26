@@ -1,0 +1,36 @@
+# Templated systemd unit: one instance per NVMe-oF volume.
+#
+# Install:
+#   sudo cp nvmeof-volume@.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable nvmeof-volume@<image-name>.service
+#
+# Where <image-name> is the RBD image / volume name passed to
+# setup-volume.sh — e.g. `workload-02`. The NQN is derived from %i
+# using the cluster's default scheme.
+#
+# Pair with an /etc/fstab entry containing:
+#   x-systemd.requires=nvmeof-volume@<image-name>.service,_netdev,nofail
+#
+# The "-" prefix on ExecStart lets the unit reach `active (exited)`
+# even if both controllers are already connected (e.g. after a manual
+# `nvme connect` during initial setup). On a clean boot both connects
+# succeed normally.
+
+[Unit]
+Description=NVMe-oF connect: %i
+Documentation=https://gitlab.alcg.io/homelab/infra/nvmeof-gateway
+After=network-online.target
+Wants=network-online.target
+Before=remote-fs-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStartPre=/sbin/modprobe nvme-tcp
+ExecStart=-/usr/sbin/nvme connect -t tcp -a 10.144.27.26 -s 4420 -n nqn.2026-05.io.alcg:%i.rbd-default
+ExecStart=-/usr/sbin/nvme connect -t tcp -a 10.144.27.26 -s 4421 -n nqn.2026-05.io.alcg:%i.rbd-default
+ExecStop=/usr/sbin/nvme disconnect -n nqn.2026-05.io.alcg:%i.rbd-default
+
+[Install]
+WantedBy=remote-fs.target
