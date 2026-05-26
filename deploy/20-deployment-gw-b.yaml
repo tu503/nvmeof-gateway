@@ -67,11 +67,13 @@ spec:
             - { name: discovery, containerPort: 8010, hostPort: 8010, protocol: TCP }
           resources:
             requests:
-              cpu: "500m"
+              # SPDK runs 4 poll-mode reactors (--lcores 0-3) at 100% each;
+              # request 2 and cap at 4 so CFS doesn't throttle the reactors.
+              cpu: "2"
               memory: "1Gi"
               hugepages-2Mi: "1Gi"
             limits:
-              cpu: "2"
+              cpu: "4"
               memory: "2Gi"
               hugepages-2Mi: "1Gi"
           volumeMounts:
