@@ -256,6 +256,84 @@ mkfs.ext4 /dev/nvme0n1
 mount /dev/nvme0n1 /mnt/demo
 ```
 
+## Proof of operational status
+
+Captured live on `sm3` `2026-05-25T20:05–20:07-04:00`. Cluster is also
+running an unrelated `sys-cluster/ceph` rebuild in parallel, which is
+competing with the gateways for CPU/disk — the IOPS numbers below are
+the floor, not a perf benchmark.
+
+### Initiator (sm3 itself, no Ceph software in the path)
+
+```
+$ nvme list
+Node           SN                  Model                  Namespace  Usage
+/dev/nvme0n1   Ceph78781237496401  Ceph bdev Controller   0x1        5.37 GB / 5.37 GB
+
+$ nvme list-subsys
+nvme-subsys0 - NQN=nqn.2026-05.io.alcg:demo.rbd-default
+               iopolicy=numa
+ +- nvme0 tcp traddr=10.144.27.26,trsvcid=4420,src_addr=10.144.27.26 live
+ +- nvme1 tcp traddr=10.144.27.26,trsvcid=4421,src_addr=10.144.27.26 live
+
+$ nvme ana-log /dev/nvme1
+grpid=2 nsid=1 state=optimized        # gw-b currently owns anagrp 2
+```
+
+### Mount + persisted files
+
+```
+$ df -hT /mnt/nvmeof-demo
+/dev/nvme0n1   ext4  4.9G  1.3M  4.6G   1%  /mnt/nvmeof-demo
+
+$ ls -la /mnt/nvmeof-demo/
+-rw-r--r--  60   May 25 19:07  both-up.txt
+-rw-r--r--  531  May 25 19:07  failover.log     # 20 ticks across a gw-a kill
+-rw-r--r--  81   May 25 18:55  proof.txt
+drwx------ 16K   May 25 18:55  lost+found
+```
+
+### fio (60s, 4k randread/randwrite 70/30, 4 jobs, iodepth=16, direct I/O via io_uring)
+
+```
+$ fio --filename=/mnt/nvmeof-demo/fio.bin --rw=randrw --rwmixread=70 \
+      --bs=4k --iodepth=16 --numjobs=4 --size=256M --runtime=60 \
+      --time_based --ioengine=io_uring --direct=1 --group_reporting
+
+read:  IOPS=153  BW=612 KiB/s  io=36.5 MiB  lat avg=416 ms
+write: IOPS=68   BW=274 KiB/s  io=16.3 MiB  lat avg=1.5 ms
+Run time: 61008 msec   nvme0n1 util=99.96%
+```
+
+Read latency is dominated by EC k=6+3 reconstruction + concurrent
+load on sm3 (the same host runs all OSDs + a parallel `emerge`).
+Writes coalesce in SPDK so they cleared at 1.5 ms despite the
+load — that's the EC pool's `allow_ec_overwrites=true` doing its job.
+
+### Cluster view + RBD usage after the fio writes
+
+```
+$ ceph nvme-gw show nvmeof rbd-default
+epoch=1230  num gws=2
+  gw-a: Availability=AVAILABLE  ana=[1:ACTIVE, 2:STANDBY]  ns=0
+  gw-b: Availability=AVAILABLE  ana=[1:STANDBY, 2:ACTIVE]  ns=1
+
+$ rbd du nvmeof/demo-nvmeof
+NAME         PROVISIONED  USED
+demo-nvmeof        5 GiB  308 MiB   # was 48 MiB pre-fio, ~260 MiB written
+```
+
+Listening sockets on sm3 (both gateways serving in parallel):
+
+```
+0.0.0.0:8009   ← gw-a discovery (python)
+0.0.0.0:8010   ← gw-b discovery (python)
+*:5500         ← gw-a gRPC control
+*:5501         ← gw-b gRPC control
+10.144.27.26:4420  ← gw-a SPDK nvme-tcp (reactor_0)
+10.144.27.26:4421  ← gw-b SPDK nvme-tcp (reactor_0)
+```
+
 ## ANA failover smoke test
 
 ```sh
