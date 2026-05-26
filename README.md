@@ -312,12 +312,72 @@ load — that's the EC pool's `allow_ec_overwrites=true` doing its job.
 
 ### Cluster view + RBD usage after the fio writes
 
+`ceph nvme-gw show <state-pool> <group-name>` is the canonical mon-side
+view of an ANA group. Live output as captured during the demo:
+
 ```
 $ ceph nvme-gw show nvmeof rbd-default
-epoch=1230  num gws=2
-  gw-a: Availability=AVAILABLE  ana=[1:ACTIVE, 2:STANDBY]  ns=0
-  gw-b: Availability=AVAILABLE  ana=[1:STANDBY, 2:ACTIVE]  ns=1
+{
+    "epoch": 1230,
+    "pool": "nvmeof",
+    "group": "rbd-default",
+    "features": "LB",                      # load-balancing ANA group
+    "rebalance_ana_group": 1,
+    "num gws": 2,
+    "GW-epoch": 887,
+    "Anagrp list": "[ 1 2 ]",              # the two ANA groups the pair owns
+    "num-namespaces": 1,                   # total namespaces in the group
+    "Created Gateways:": [
+        {
+            "gw-id": "gw-a",
+            "anagrp-id": 1,                # gw-a's owned anagrp (when ACTIVE)
+            "num-namespaces": 0,           # no namespace assigned to anagrp 1 yet
+            "performed-full-startup": 1,
+            "Availability": "AVAILABLE",
+            "num-listeners": 1,
+            "ana states": " 1: ACTIVE ,  2: STANDBY "
+        },
+        {
+            "gw-id": "gw-b",
+            "anagrp-id": 2,
+            "num-namespaces": 1,           # the demo namespace lives in anagrp 2
+            "performed-full-startup": 1,
+            "Availability": "AVAILABLE",
+            "num-listeners": 1,
+            "ana states": " 1: STANDBY ,  2: ACTIVE "
+        }
+    ]
+}
+```
 
+What to read from it:
+
+- **`Availability: AVAILABLE`** on both — beacons are reaching mon and
+  both gateways are in the map. Other states are `CREATED` (registered
+  but not yet beaconing), `UNAVAILABLE` (beacon timeout), `DELETED`.
+- **`ana states`** is per-gateway-per-anagrp. Each gateway is `ACTIVE`
+  for exactly one anagrp and `STANDBY` for the others. Initiators see
+  the same picture via the NVMe-oF ANA Group Descriptor and route I/O
+  to the `ACTIVE` (Optimized) controller for each namespace.
+- **`num-namespaces`** per gateway shows which anagrp the demo image
+  landed in: anagrp 2 → gw-b is the optimized path for `nsid=1`.
+- **`GW-epoch`** ticks each time mon emits a new map. A stable GW-epoch
+  means no rebalancing is happening — that's healthy steady state.
+
+Related commands:
+
+```sh
+ceph nvme-gw show       <pool> <group>          # the above
+ceph nvme-gw listeners  <pool> <group>          # all listeners across both gws
+ceph nvme-gw create     <gw-id> <pool> <group>  # register a new gateway
+ceph nvme-gw delete     <gw-id> <pool> <group>  # remove a stuck gateway
+ceph nvme-gw enable | disable <gw-id> <pool> <group>
+ceph nvme-gw set-location <gw-id> <pool> <group> <site>   # multi-site
+```
+
+And the RBD-side proof that fio traffic actually went into the EC pool:
+
+```
 $ rbd du nvmeof/demo-nvmeof
 NAME         PROVISIONED  USED
 demo-nvmeof        5 GiB  308 MiB   # was 48 MiB pre-fio, ~260 MiB written
