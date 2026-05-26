@@ -33,7 +33,7 @@ spec:
       dnsPolicy: ClusterFirstWithHostNet
       containers:
         - name: gateway
-          image: registry.alcg.io/ceph-nvmeof:upstream
+          image: registry.alcg.io/ceph-nvmeof:v20.1.1-homelab
           imagePullPolicy: IfNotPresent
           securityContext:
             privileged: true
