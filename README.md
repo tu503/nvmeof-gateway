@@ -394,6 +394,190 @@ Listening sockets on sm3 (both gateways serving in parallel):
 10.144.27.26:4421  ← gw-b SPDK nvme-tcp (reactor_0)
 ```
 
+## End-to-end: new RBD-backed NVMe-oF volume → mount on Ubuntu 24.04
+
+A full walk-through, carving and exposing a new image and attaching it
+from a fresh client. Substitute names freely.
+
+### Sizing decision (briefly)
+
+Pick a metadata pool (replicated, holds RBD header + object map) and
+optionally a separate data pool (typically EC for capacity). This repo
+provisions both already:
+
+| Image lives in pool…    | Data pool…                         | When |
+| ---------------------- | ---------------------------------- | ---- |
+| `nvmeof`               | (none — single replicated pool)    | Tiny test volumes |
+| `nvmeof` (metadata)    | `nvmeof-data` (EC k=6 m=3)         | Default for real workloads |
+| `rbd` or other         | `rbd-ec` etc.                      | If reusing existing pools |
+
+### Step 1 — carve the RBD image (run on any host with admin keyring, e.g. sm3)
+
+```sh
+IMG=workload-01
+SIZE=100G
+
+rbd create nvmeof/$IMG \
+    --size $SIZE \
+    --data-pool nvmeof-data \
+    --image-feature layering,exclusive-lock,object-map,fast-diff,deep-flatten
+
+rbd info nvmeof/$IMG   # confirm data_pool: nvmeof-data
+```
+
+### Step 2 — register it as a namespace under a subsystem
+
+Decide on the subsystem NQN. The convention is
+`nqn.<YYYY-MM>.<reverse-fqdn>:<freeform>`. Note that ceph-nvmeof
+auto-appends the ANA group name to the NQN you provide.
+
+```sh
+NQN=nqn.2026-05.io.alcg:workload-01     # mon's ANA group will append ".rbd-default"
+SM3=10.144.27.26
+
+# Helper — runs the nvmeof-cli upstream image as a one-shot pod
+cli() {
+  local port=$1; shift
+  kubectl run nvmeof-cli --rm -i --restart=Never --quiet \
+    --image=quay.io/ceph/nvmeof-cli:1.6.14 \
+    --command -- python3 -m control.cli \
+      --server-address $SM3 --server-port $port "$@"
+}
+
+# 1. Create the subsystem (idempotent if it already exists)
+cli 5500 subsystem add --subsystem "$NQN" --max-namespaces 32
+
+# 2. Attach the RBD image as namespace ID 1
+cli 5500 namespace add \
+    --subsystem "$NQN.rbd-default" \
+    --rbd-pool nvmeof --rbd-image $IMG --nsid 1
+
+# 3. Register a listener on each gateway. Use --force so the gw-id name
+#    check doesn't trip on the hostNetwork+unshare-UTS setup.
+cli 5500 listener add --subsystem "$NQN.rbd-default" --host-name gw-a \
+    --traddr $SM3 --trsvcid 4420 --adrfam ipv4 --force
+cli 5501 listener add --subsystem "$NQN.rbd-default" --host-name gw-b \
+    --traddr $SM3 --trsvcid 4421 --adrfam ipv4 --force
+
+# 4. Permit a specific host NQN, or open to any (demo-style)
+cli 5500 host add --subsystem "$NQN.rbd-default" --host-nqn '*'
+# For prod, restrict — generate the client's hostnqn on the initiator
+# (see Step 3 below), then pass:
+#   cli 5500 host add --subsystem "$NQN.rbd-default" \
+#       --host-nqn nqn.2014-08.org.nvmexpress:uuid:<CLIENT-UUID>
+```
+
+Confirm the subsystem is wired:
+
+```sh
+cli 5500 subsystem list                                  # shows NQN + ns count + Allow Any Host
+cli 5500 listener list --subsystem "$NQN.rbd-default"    # both listeners present
+ceph nvme-gw listeners nvmeof rbd-default                # mon-side view
+```
+
+### Step 3 — attach from an Ubuntu 24.04 client
+
+```sh
+# Package install
+sudo apt-get update
+sudo apt-get install -y nvme-cli
+
+# Kernel module — nvme-tcp is the transport, nvme-fabrics is the umbrella
+sudo modprobe nvme-tcp
+ls /dev/nvme-fabrics                                     # must exist
+
+# Each client gets a stable host NQN. Ubuntu generates one at install
+# time; use whatever's in /etc/nvme/hostnqn (or generate fresh):
+sudo install -d -m 755 /etc/nvme
+test -f /etc/nvme/hostnqn || sudo bash -c \
+  'echo "nqn.2014-08.org.nvmexpress:uuid:$(uuidgen)" > /etc/nvme/hostnqn'
+cat /etc/nvme/hostnqn
+
+# Discover what's available at gw-a's discovery service (port 8009)
+sudo nvme discover -t tcp -a 10.144.27.26 -s 8009
+
+# Connect using --multipath via the discovery service: this picks up
+# BOTH listeners (sm3:4420 and sm3:4421) from the discovery log and
+# wires them as nvme0 + nvme1 under the same subsystem.
+sudo nvme connect-all -t tcp -a 10.144.27.26 -s 8009 \
+    --hostnqn=$(cat /etc/nvme/hostnqn)
+
+# Verify multipath
+sudo nvme list-subsys
+# Should print one subsystem with iopolicy=numa and two `live` controllers.
+
+# The block device shows up at /dev/nvmeXn1 (where X is the next free
+# subsystem number). lsblk to find it deterministically:
+lsblk -o NAME,SIZE,MODEL | grep "Ceph bdev"
+sudo nvme list
+
+# Format + mount (one-time)
+DEV=/dev/nvme0n1                                         # adjust per lsblk
+sudo mkfs.ext4 -F $DEV
+sudo mkdir -p /mnt/workload-01
+sudo mount $DEV /mnt/workload-01
+
+# Want it persistent? Use the by-id path so the device name doesn't
+# matter across reboots (kernel assigns nvmeX nondeterministically):
+ls -la /dev/disk/by-id/ | grep nvme-Ceph
+# /dev/disk/by-id/nvme-Ceph_bdev_Controller_Ceph78781237496401_1
+# Add to /etc/fstab:
+#   /dev/disk/by-id/nvme-Ceph_bdev_Controller_... /mnt/workload-01 ext4 \
+#     defaults,_netdev,noatime,x-systemd.requires=nvmefc-connect-all.service 0 0
+```
+
+### Step 4 — autoconnect on boot (Ubuntu 24.04)
+
+`nvme-cli` 2.x ships a systemd timer/unit that reads
+`/etc/nvme/discovery.conf` and re-issues `nvme connect-all` at boot:
+
+```sh
+sudo install -d -m 755 /etc/nvme
+
+cat | sudo tee /etc/nvme/discovery.conf <<'EOF'
+# host
+--transport=tcp --traddr=10.144.27.26 --trsvcid=8009
+EOF
+
+sudo systemctl enable --now nvmf-autoconnect.service
+sudo systemctl status nvmf-autoconnect.service
+```
+
+After this, a reboot will re-establish both controllers automatically;
+the `x-systemd.requires=` line in `/etc/fstab` ensures the mount waits
+for the device to appear.
+
+### Step 5 — verify and exercise
+
+```sh
+# Show ANA state (which path is optimized for this namespace)
+sudo nvme ana-log /dev/nvme0
+sudo nvme ana-log /dev/nvme1
+
+# Quick I/O sanity
+sudo dd if=/dev/urandom of=/mnt/workload-01/test.bin bs=1M count=64 oflag=direct
+sudo md5sum /mnt/workload-01/test.bin
+
+# Cluster-side proof the bytes actually traversed all the way down
+ssh sm3 -- rbd du nvmeof/$IMG       # USED column climbs
+```
+
+### Tear-down
+
+Client side:
+```sh
+sudo umount /mnt/workload-01
+sudo nvme disconnect -n nqn.2026-05.io.alcg:workload-01.rbd-default
+sudo nvme list-subsys                # subsystem should be gone
+```
+
+Cluster side:
+```sh
+cli 5500 namespace del --subsystem "$NQN.rbd-default" --nsid 1
+cli 5500 subsystem del --subsystem "$NQN.rbd-default" --force
+rbd rm nvmeof/$IMG
+```
+
 ## ANA failover smoke test
 
 ```sh
