@@ -102,13 +102,13 @@ echo "[2/5] subsystem ${NQN}"
 if cli "${GW_A_PORT}" subsystem list 2>/dev/null | grep -q "${NQN}"; then
   echo "      already exists — leaving alone"
 else
-  cli "${GW_A_PORT}" subsystem add --subsystem "${NQN}" --max-namespaces 32 --no-group-append-nqn || true
+  cli "${GW_A_PORT}" subsystem add --subsystem "${NQN_BASE}" --max-namespaces 32 || true
   echo "      created"
 fi
 
 # ---------------------------------------------------------- 3. Namespace
 echo "[3/5] namespace nsid=${NSID} → ${POOL_META}/${IMAGE}"
-if cli "${GW_A_PORT}" namespace list --subsystem "${NQN}" 2>/dev/null | grep -q "\| ${NSID} \|"; then
+if cli "${GW_A_PORT}" namespace list --subsystem "${NQN}" 2>/dev/null | grep -q "${POOL_META}/${IMAGE}"; then
   echo "      already exists — leaving alone"
 else
   cli "${GW_A_PORT}" namespace add \
