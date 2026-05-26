@@ -610,6 +610,70 @@ ceph nvme-gw delete gw-a nvmeof rbd-default
 ceph nvme-gw create gw-a nvmeof rbd-default
 ```
 
+## NVMe-oF gateway overhead vs. direct krbd
+
+Same RBD image (`nvmeof/workload-02`, 100 GiB, xfs), same host, same
+fio job file — only the transport differs. Run on `g469`, which
+doubles as gateway host and initiator (loopback, no NIC hop), so
+this isolates the SPDK gateway cost from any real network cost.
+
+Backend A: xfs over `nvme-tcp` to both gateways (`:4420` + `:4421`,
+ANA multipath via `nvme-subsys1`).
+Backend B: xfs over `krbd` (`rbd map nvmeof/workload-02` → `/dev/rbd3`).
+Between runs: `umount` → `systemctl stop nvmeof-workload-02` →
+`rbd map` → remount, then the reverse to restore.
+
+Job file (`/tmp/fio-baseline.ini`):
+
+```ini
+[global]
+ioengine=libaio
+direct=1
+group_reporting=1
+runtime=30
+time_based=1
+ramp_time=2
+filename=/mnt/workload-02/fio-test.bin
+size=4G
+refill_buffers=1
+
+[seq-write-1M] stonewall ; rw=write     ; bs=1M ; iodepth=8
+[seq-read-1M]  stonewall ; rw=read      ; bs=1M ; iodepth=8
+[rand-write-4k]stonewall ; rw=randwrite ; bs=4k ; iodepth=32
+[rand-read-4k] stonewall ; rw=randread  ; bs=4k ; iodepth=32
+```
+
+Results (`sync && echo 3 > /proc/sys/vm/drop_caches` before each run):
+
+| Test                       | NVMe-oF (nvme-tcp ×2)        | Direct krbd                 | Δ                  |
+|----------------------------|------------------------------|-----------------------------|--------------------|
+| seq write  1M, iod=8       | 38.5 MiB/s · 38 IOPS · 208 ms | 38.4 MiB/s · 38 IOPS · 208 ms | tie                |
+| seq read   1M, iod=8       | 27.9 MiB/s · 27 IOPS · 288 ms | 108  MiB/s · 107 IOPS · 74 ms | **3.87× krbd**     |
+| rand write 4k, iod=32      | 403 KiB/s · 99 IOPS · 326 ms  | 356 KiB/s · 87 IOPS · 362 ms  | tie (within noise) |
+| rand read  4k, iod=32      | 6.6 MiB/s · 1691 IOPS · 20.6 ms | 10.7 MiB/s · 2730 IOPS · 11.7 ms | **1.62× krbd**     |
+
+Takeaways:
+
+- **Writes are transport-independent.** Both paths bottleneck on
+  RADOS replication into the EC `nvmeof-data` pool; the SPDK gateway
+  adds no measurable write overhead on this cluster (write IOPS,
+  bandwidth and avg latency all match within run-to-run noise).
+- **Reads pay a real gateway tax.** Sequential reads are ~3.9×
+  slower over `nvme-tcp` and random reads ~1.6× slower. krbd issues
+  parallel librados ops and benefits from kernel read-ahead; the
+  SPDK reactor's per-namespace serialization is the apparent
+  ceiling.
+- **Same-host caveat.** Both runs are loopback. A remote initiator
+  over a real NIC would add `nvme-tcp` framing/TCP cost to backend
+  A only, widening the read gap further — but giving NVMe-oF its
+  actual advantage: zero Ceph software on the client.
+- **Absolute numbers are homelab-scale** (one EC k=6+3 pool on one
+  host, parallel `emerge` not necessarily quiesced). The ratio is
+  the portable finding; the magnitudes are not.
+
+Raw fio output preserved under `/tmp/fio-results/{nvmeof,krbd}.txt`
+on `g469` for cross-checking.
+
 ## Caveats
 
 - **Single-host placement.** Both gateways pinned to sm3. If sm3
