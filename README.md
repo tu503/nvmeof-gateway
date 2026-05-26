@@ -11,7 +11,13 @@ Block-device analogue of `homelab/infra/rgw-gateway` (S3) — same Ceph
 cluster, same general pattern, but with substantial differences in
 how the pods are networked (see Architecture).
 
+<details open>
+<summary>
+
 ## Architecture
+
+</summary>
+
 
 ```mermaid
 flowchart LR
@@ -41,7 +47,15 @@ drives failover when a gateway stops beaconing, and exposes the
 That code is gated by `sys-cluster/ceph USE="nvmeof spdk"`; the
 homelab `package.use/ceph` covers it.
 
+</details>
+
+<details open>
+<summary>
+
 ## Key design moves (why this is non-trivial)
+
+</summary>
+
 
 Several upstream-ceph-nvmeof assumptions broke in our deployment;
 these are the workarounds:
@@ -106,7 +120,15 @@ these are the workarounds:
   - protobuf pinned `<5` in `build-image.sh`; the 5.x runtime is
     layered on at image-bump time.
 
+</details>
+
+<details open>
+<summary>
+
 ## Layout
+
+</summary>
+
 
 ```
 00-namespace.yaml                    ns nvmeof-gateway
@@ -137,7 +159,15 @@ flux/
 There are **no Service objects** (orphaned after the hostNetwork
 pivot — they were removed in commit `f65d5b4`).
 
+</details>
+
+<details>
+<summary>
+
 ## Pools
+
+</summary>
+
 
 | Pool           | Type                  | Used for                                |
 | -------------- | --------------------- | --------------------------------------- |
@@ -151,7 +181,15 @@ rbd create nvmeof/demo-nvmeof --size 5G --data-pool nvmeof-data \
     --image-feature layering,exclusive-lock,object-map,fast-diff,deep-flatten
 ```
 
+</details>
+
+<details>
+<summary>
+
 ## Caps on `client.nvmeof.gw-{a,b}`
+
+</summary>
+
 
 ```
 mon  "profile rbd"
@@ -163,7 +201,15 @@ osd  "profile rbd pool=nvmeof, profile rbd pool=nvmeof-data, profile rbd pool=rb
 nvmeof state + data pools (and the pre-existing `rbd` pool for the
 metadata-coresident case).
 
+</details>
+
+<details>
+<summary>
+
 ## Mon-side prerequisites (one-time on sm3)
+
+</summary>
+
 
 ```sh
 # Cluster Ceph must be built with USE="nvmeof spdk" + the two patches.
@@ -188,7 +234,15 @@ ceph config set mon nvmeof_mon_client_connect_panic 300
 ceph config set mon nvmeof_mon_client_disconnect_panic 600
 ```
 
+</details>
+
+<details>
+<summary>
+
 ## First-time bring-up
+
+</summary>
+
 
 ```sh
 # 1. Provision pools + cephx clients + gateway-group + sealed yamls.
@@ -208,7 +262,15 @@ kubectl apply -f flux/source.yaml -f flux/kustomization.yaml
 After step 3, any commit to `main` is reconciled automatically.
 That includes the `flux/` directory itself.
 
+</details>
+
+<details>
+<summary>
+
 ## Adding a subsystem / namespace
+
+</summary>
+
 
 End-to-end provisioning is a single command:
 
@@ -228,7 +290,15 @@ rados -p nvmeof listomapkeys nvmeof.rbd-default.state | grep ^listener_
 rados -p nvmeof rmomapkey  nvmeof.rbd-default.state listener_<NQN>_<gw>_TCP_<addr>_<port>
 ```
 
+</details>
+
+<details>
+<summary>
+
 ## Initiator side (any Linux box, no Ceph install needed)
+
+</summary>
+
 
 ```sh
 modprobe nvme-tcp
@@ -248,7 +318,15 @@ lsblk -o NAME,SIZE,MODEL | grep "Ceph bdev"   # find the device
 # below for the persistent-mount / autoconnect pieces.
 ```
 
+</details>
+
+<details>
+<summary>
+
 ## Proof of operational status
+
+</summary>
+
 
 Captured live on `sm3` `2026-05-25T20:05–20:07-04:00`. Cluster is also
 running an unrelated `sys-cluster/ceph` rebuild in parallel, which is
@@ -386,7 +464,15 @@ Listening sockets on sm3 (both gateways serving in parallel):
 10.144.27.26:4421  ← gw-b SPDK nvme-tcp (reactor_0)
 ```
 
+</details>
+
+<details>
+<summary>
+
 ## End-to-end: new RBD-backed NVMe-oF volume → mount on Ubuntu 24.04
+
+</summary>
+
 
 A full walk-through, carving and exposing a new image and attaching it
 from a fresh client. Substitute names freely.
@@ -583,7 +669,15 @@ cli 5500 subsystem del --subsystem "$NQN.rbd-default" --force
 rbd rm nvmeof/$IMG
 ```
 
+</details>
+
+<details>
+<summary>
+
 ## ANA failover smoke test
+
+</summary>
+
 
 ```sh
 ( while true; do
@@ -599,7 +693,15 @@ ceph nvme-gw delete gw-a nvmeof rbd-default
 ceph nvme-gw create gw-a nvmeof rbd-default
 ```
 
+</details>
+
+<details>
+<summary>
+
 ## NVMe-oF gateway overhead vs. direct krbd
+
+</summary>
+
 
 Same RBD image (`nvmeof/workload-02`, 100 GiB, xfs), same host, same
 fio job file — only the transport differs. Run on `sm3`, which
@@ -664,7 +766,15 @@ Takeaways:
 Raw fio output preserved under `/tmp/fio-results/{nvmeof,krbd}.txt`
 on `sm3` for cross-checking.
 
+</details>
+
+<details>
+<summary>
+
 ## NVMe→RBD translation: where does the overhead live?
+
+</summary>
+
 
 When the SPDK gateway receives an NVMe command on the wire, four layers
 sit between it and the OSDs. Source paths reference SPDK at the
@@ -742,7 +852,15 @@ reactor's message-ring pickup of completions stalled for entire CFS
 slices. The write path doesn't move with more CPU because the
 bottleneck is below bdev_rbd entirely (librbd → EC commit).
 
+</details>
+
+<details>
+<summary>
+
 ## Caveats
+
+</summary>
+
 
 - **Single-host placement.** Both gateways pinned to sm3. If sm3
   goes down, the data path stops. Multi-host HA needs a second
@@ -779,7 +897,15 @@ bottleneck is below bdev_rbd entirely (librbd → EC commit).
   transient helper container that just sends gRPC to the gateway —
   no ABI ties to our cluster. Replace if it ever drifts.
 
+</details>
+
+<details>
+<summary>
+
 ## TODO
+
+</summary>
+
 
 - Add a Grafana dashboard panel for SPDK + NVMeofGwMon stats.
 - Consider mTLS on the gRPC control plane (currently
@@ -790,3 +916,5 @@ bottleneck is below bdev_rbd entirely (librbd → EC commit).
 - OpenTelemetry instrumentation in `bdev_rbd.c` (gateway-side spans
   exported to tempo; first cut is gateway-only, full end-to-end
   needs a `traceparent` hook in librbd).
+
+</details>
