@@ -674,6 +674,84 @@ Takeaways:
 Raw fio output preserved under `/tmp/fio-results/{nvmeof,krbd}.txt`
 on `g469` for cross-checking.
 
+## NVMe→RBD translation: where does the overhead live?
+
+When the SPDK gateway receives an NVMe command on the wire, four layers
+sit between it and the OSDs. Source paths reference SPDK at the
+`ceph-nvmeof-v25.09` pin (the submodule ceph-nvmeof 1.6.14 ships):
+
+1. **NVMe-TCP wire** — `lib/nvmf/tcp.c`. The reactor poll loop
+   reads PDUs (CapsuleCmd, H2C_Data, etc.), pulls the 64-byte NVMe
+   command out of the capsule, and hands it up.
+2. **Fabric dispatch** — `lib/nvmf/ctrlr.c`. Validates the command,
+   picks the namespace, splits admin vs I/O.
+3. **NVMe-opcode → bdev-IO** — `lib/nvmf/ctrlr_bdev.c`:
+    - `nvmf_bdev_ctrlr_read_cmd()` (line 440) extracts `start_lba`
+      and `num_blocks` from the NVMe command, calls
+      `spdk_bdev_readv_blocks_ext()` with an `accel_sequence` for
+      optional DMA/CRC offload, and returns
+      `SPDK_NVMF_REQUEST_EXEC_STATUS_ASYNCHRONOUS` while the bdev
+      submits.
+    - `nvmf_bdev_ctrlr_write_cmd()` (line 493) is the symmetric
+      write path; threads the precomputed CRC32c through
+      `spdk_bdev_ext_io_opts` so bdev_rbd can pick the with-CRC
+      variant when librbd supports it.
+4. **bdev → librbd** — `module/bdev/rbd/bdev_rbd.c`, the `switch
+   (bdev_io->type)` around line 732:
+
+   ```c
+   case SPDK_BDEV_IO_TYPE_READ:           rbd_aio_read()
+   case SPDK_BDEV_IO_TYPE_WRITE:          rbd_aio_write()         /* ← our path */
+   case SPDK_BDEV_IO_TYPE_UNMAP:          rbd_aio_discard()
+   case SPDK_BDEV_IO_TYPE_FLUSH:          rbd_aio_flush()
+   case SPDK_BDEV_IO_TYPE_WRITE_ZEROES:   rbd_aio_write_zeroes()
+   case SPDK_BDEV_IO_TYPE_COMPARE_AND_WRITE: rbd_aio_compare_and_writev()
+   ```
+
+   Past this point it's `librbd.so → librados.so → wire to OSDs`
+   (the EC encode happens client-side in librbd). **No SPDK code is
+   on the data path beyond this call.**
+
+The completion ride is the mirror image: librbd → `bdev_rbd_finish_aiocb`
+(line 727) → `bdev_rbd_io_complete` → bdev generic → `nvmf_bdev_ctrlr_complete_cmd`
+→ TCP PDU back to the initiator.
+
+What this means for the latency budget vs. krbd:
+
+- TCP parse + opcode switch + LBA math: **tens of µs**. Negligible
+  next to RADOS round-trips.
+- The 200–400 ms p99 we see on EC writes is **librbd → OSD EC k=6+3
+  commit**. Same code krbd's `rbd.ko` runs, just from kernelspace.
+- Real SPDK gateway tax, in order of cost:
+    1. One extra TCP socket hop on both the request and reply leg —
+       the krbd client doesn't have it.
+    2. Two thread-boundary crossings per I/O on the gateway:
+        - **Submit**: `bdev_rbd_submit_request` records `submit_td =
+          spdk_io_channel_get_thread(ch)` (line 984) and fires
+          `rbd_aio_*`, which returns immediately. The actual work
+          runs on a librbd worker thread (its own pool, not SPDK's).
+        - **Complete**: librbd's worker invokes
+          `bdev_rbd_finish_aiocb` (line 688), then
+          `bdev_rbd_io_complete` (line 672) checks current thread
+          vs. submit_td and, if they differ, does
+          `spdk_thread_send_msg(rbd_io->submit_td,
+          _bdev_rbd_io_complete, rbd_io)` (line 681) to bounce the
+          completion back to the originating reactor.
+    3. The `spdk_thread_send_msg` is a lock-free MPMC ring enqueue
+       + reactor poll-cycle pickup — **~1 µs when the reactor is
+       spinning hot**, but the pickup latency scales linearly with
+       however long the reactor goes without polling.
+
+There is no per-I/O poller in `bdev_rbd` (no `bdev_rbd_poll`); the
+completion path is purely librbd-callback-driven.
+
+This is why bumping the pod CPU limit from 2 → 4 cores (matching
+SPDK's `--lcores 0-3`) immediately recovered ~40% read IOPS: at the
+2-core cap, 4 poll reactors were CFS-throttled to ~50% each, so the
+reactor's message-ring pickup of completions stalled for entire CFS
+slices. The write path doesn't move with more CPU because the
+bottleneck is below bdev_rbd entirely (librbd → EC commit).
+
 ## Caveats
 
 - **Single-host placement.** Both gateways pinned to sm3. If sm3
