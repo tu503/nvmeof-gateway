@@ -79,19 +79,32 @@ these are the workarounds:
   - `verify_listener_ip = False` — we advertise sm3's IP but bind
     `0.0.0.0` internally.
   - `abort_on_update_error = False` / `abort_on_errors = False` —
-    the gateway must not suicide on transient state-update rpc
+    the gateway must not terminate on transient state-update rpc
     failures (e.g. the other gateway's listener-add whose host-name
     doesn't match).
   - `cluster_connections = 32` in `[spdk]` — required cluster
     allocator strategy.
   - `log_level = WARNING` (not `WARN`; protobuf enum is strict).
-- **Image: `registry.alcg.io/ceph-nvmeof:upstream`.** Just a retag
-  of upstream `quay.io/ceph/nvmeof:1.6.14`. An attempt to overlay
-  the host's librbd / libstdc++ / libgcc_s / glibc into the upstream
-  container hit an irrecoverable ABI cascade (each layer pulled in
-  a newer dep). Sticking with upstream as-is is the pragmatic
-  compromise; cluster Ceph 20.1.1 vs container's 20.2.1 librbd is
-  within ABI compat (same major.minor.release-line).
+- **Image: `registry.alcg.io/ceph-nvmeof:v20.1.1-homelab`, built fully
+  from local artifacts** (no upstream container in the lineage).
+  `build-image.sh` assembles it from scratch via buildah:
+  - SPDK `nvmf_tgt` + libs built from source at the `ceph-nvmeof-v25.09`
+    pin, with the `bdev_rbd` CRC32 fast-path stubbed to plain
+    `rbd_aio_write` (our librbd doesn't expose that API).
+  - Host's `librbd.so` / `librados.so` / `rados-classes` / `ceph-nvmeof-monitor-client`
+    from the `sys-cluster/ceph-999` install — same ABI as the daemons.
+  - Host's `python3.13` (the real ELF, not the Gentoo `python-exec`
+    wrapper) plus the rados/rbd Cython bindings.
+  - ceph-nvmeof control-plane Python at tag 1.6.14, with gRPC stubs
+    regenerated using `grpcio_tools < 1.71` (so the gencode targets
+    protobuf 5.x, matching the runtime we pin), and `cli.py / state.py
+    / grpc.py` patched to rename `including_default_value_fields` →
+    `always_print_fields_with_no_presence` for protobuf 5.x.
+  - All `ldd`-resolved deps from `/usr/lib64` (gentoo glibc, libstdc++
+    from gcc-15, libabsl_*, libgrpc, libprotobuf) — same ABI as the
+    monitor-client expects, since both come from this host.
+  - protobuf pinned `<5` in `build-image.sh`; the 5.x runtime is
+    layered on at image-bump time.
 
 ## Layout
 
@@ -110,7 +123,10 @@ setup-group.sh                       idempotent: pools + cephx + `ceph nvme-gw c
 setup-volume.sh                      idempotent: rbd image + subsystem + namespace +
                                        listeners + host allow — single command to provision
                                        a new RBD-backed NVMe-oF volume (see walkthrough below)
-build-image.sh                       (currently a thin retag of quay.io/ceph/nvmeof:1.6.14)
+build-image.sh                       scratch-base buildah assembly: host
+                                       librbd/librados + locally-built SPDK
+                                       + ceph-nvmeof 1.6.14 python control plane
+fio-compare.sh                       NVMe-oF vs krbd-direct fio sweep on raw devices
 
 flux/
 ├── source.yaml                      GitRepository nvmeof-gateway → this repo
@@ -178,11 +194,10 @@ ceph config set mon nvmeof_mon_client_disconnect_panic 600
 # 1. Provision pools + cephx clients + gateway-group + sealed yamls.
 ./setup-group.sh
 
-# 2. Ensure registry has the image (one-time):
-buildah pull quay.io/ceph/nvmeof:1.6.14
-buildah tag  quay.io/ceph/nvmeof:1.6.14 registry.alcg.io/ceph-nvmeof:upstream
-buildah push registry.alcg.io/ceph-nvmeof:upstream \
-    "oci-archive:/tmp/ceph-nvmeof.tar:registry.alcg.io/ceph-nvmeof:upstream"
+# 2. Build the gateway image locally and import into containerd:
+./build-image.sh
+buildah push registry.alcg.io/ceph-nvmeof:v20.1.1-homelab \
+    "oci-archive:/tmp/ceph-nvmeof.tar:registry.alcg.io/ceph-nvmeof:v20.1.1-homelab"
 ctr -n k8s.io images import /tmp/ceph-nvmeof.tar
 
 # 3. Bootstrap flux (see flux/README.md for deploy-key prereqs):
@@ -195,47 +210,18 @@ That includes the `flux/` directory itself.
 
 ## Adding a subsystem / namespace
 
-Both gateways host the same subsystem under ANA. Register the
-subsystem once, then add a listener per gateway:
+End-to-end provisioning is a single command:
 
 ```sh
-NQN="nqn.2026-05.io.alcg:demo.rbd-default"   # group name auto-appended
-SM3=10.144.27.26
-
-# 1. Subsystem (talk to either gateway; state propagates via OMAP)
-kubectl run nvmeof-cli --rm -i --restart=Never \
-  --image=quay.io/ceph/nvmeof-cli:1.6.14 -- python3 -m control.cli \
-  --server-address $SM3 --server-port 5500 \
-    subsystem add --subsystem "$NQN" --max-namespaces 32
-
-# 2. Namespace (rbd image → nsid 1)
-kubectl run nvmeof-cli --rm -i --restart=Never \
-  --image=quay.io/ceph/nvmeof-cli:1.6.14 -- python3 -m control.cli \
-  --server-address $SM3 --server-port 5500 \
-    namespace add --subsystem "$NQN" --rbd-pool nvmeof --rbd-image demo-nvmeof --nsid 1
-
-# 3. Listener on each gateway (--force bypasses host-name check; harmless here)
-kubectl run nvmeof-cli --rm -i --restart=Never \
-  --image=quay.io/ceph/nvmeof-cli:1.6.14 -- python3 -m control.cli \
-  --server-address $SM3 --server-port 5500 \
-    listener add --subsystem "$NQN" --host-name gw-a \
-    --traddr $SM3 --trsvcid 4420 --adrfam ipv4 --force
-
-kubectl run nvmeof-cli --rm -i --restart=Never \
-  --image=quay.io/ceph/nvmeof-cli:1.6.14 -- python3 -m control.cli \
-  --server-address $SM3 --server-port 5501 \
-    listener add --subsystem "$NQN" --host-name gw-b \
-    --traddr $SM3 --trsvcid 4421 --adrfam ipv4 --force
-
-# 4. Allow any host (demo only — tighten for prod)
-kubectl run nvmeof-cli --rm -i --restart=Never \
-  --image=quay.io/ceph/nvmeof-cli:1.6.14 -- python3 -m control.cli \
-  --server-address $SM3 --server-port 5500 \
-    host add --subsystem "$NQN" --host-nqn '*'
+./setup-volume.sh -i <image-name> -s <size>
+# e.g. ./setup-volume.sh -i workload-01 -s 100G
 ```
 
-If old listeners with bad addresses are stuck in OMAP, you can also
-delete them directly:
+The script creates the RBD image, the subsystem, the namespace, both
+listeners, and the host allow-list (default `*`). It's idempotent —
+re-runs are safe. For the underlying CLI calls (or to mutate a single
+step), see the [end-to-end walkthrough](#end-to-end-new-rbd-backed-nvme-of-volume--mount-on-ubuntu-2404)
+below; for emergency cleanup of OMAP listener garbage:
 
 ```sh
 rados -p nvmeof listomapkeys nvmeof.rbd-default.state | grep ^listener_
@@ -246,17 +232,20 @@ rados -p nvmeof rmomapkey  nvmeof.rbd-default.state listener_<NQN>_<gw>_TCP_<add
 
 ```sh
 modprobe nvme-tcp
-SM3=10.144.27.26
-NQN=nqn.2026-05.io.alcg:demo.rbd-default
-HOSTNQN="nqn.2014-08.org.nvmexpress:uuid:$(uuidgen)"
+test -f /etc/nvme/hostnqn || \
+  echo "nqn.2014-08.org.nvmexpress:uuid:$(uuidgen)" | sudo tee /etc/nvme/hostnqn
 
-nvme discover -t tcp -a $SM3 -s 8009
-nvme connect -t tcp -a $SM3 -s 4420 -n "$NQN" --hostnqn="$HOSTNQN"
-nvme connect -t tcp -a $SM3 -s 4421 -n "$NQN" --hostnqn="$HOSTNQN"
+# discover-and-connect-all: picks up BOTH listeners from the discovery
+# log (sm3:4420 + sm3:4421) and wires them as two paths under one
+# subsystem. Don't run two `nvme connect`s by hand — connect-all gets
+# multipath right.
+sudo nvme connect-all -t tcp -a 10.144.27.26 -s 8009 \
+    --hostnqn=$(cat /etc/nvme/hostnqn)
 
 nvme list-subsys             # should show 2 paths, both `live`
-mkfs.ext4 /dev/nvme0n1
-mount /dev/nvme0n1 /mnt/demo
+lsblk -o NAME,SIZE,MODEL | grep "Ceph bdev"   # find the device
+# then mkfs.ext4 / mount as usual; see the Ubuntu 24.04 walkthrough
+# below for the persistent-mount / autoconnect pieces.
 ```
 
 ## Proof of operational status
@@ -613,15 +602,16 @@ ceph nvme-gw create gw-a nvmeof rbd-default
 ## NVMe-oF gateway overhead vs. direct krbd
 
 Same RBD image (`nvmeof/workload-02`, 100 GiB, xfs), same host, same
-fio job file — only the transport differs. Run on `g469`, which
+fio job file — only the transport differs. Run on `sm3`, which
 doubles as gateway host and initiator (loopback, no NIC hop), so
 this isolates the SPDK gateway cost from any real network cost.
 
 Backend A: xfs over `nvme-tcp` to both gateways (`:4420` + `:4421`,
 ANA multipath via `nvme-subsys1`).
 Backend B: xfs over `krbd` (`rbd map nvmeof/workload-02` → `/dev/rbd3`).
-Between runs: `umount` → `systemctl stop nvmeof-workload-02` →
-`rbd map` → remount, then the reverse to restore.
+Between runs: `umount` → `nvme disconnect` → `rbd map` → remount,
+then the reverse to restore. `fio-compare.sh` in this repo runs the
+same comparison in a single pass (raw devices, no fs).
 
 Job file (`/tmp/fio-baseline.ini`):
 
@@ -672,7 +662,7 @@ Takeaways:
   the portable finding; the magnitudes are not.
 
 Raw fio output preserved under `/tmp/fio-results/{nvmeof,krbd}.txt`
-on `g469` for cross-checking.
+on `sm3` for cross-checking.
 
 ## NVMe→RBD translation: where does the overhead live?
 
@@ -772,27 +762,31 @@ bottleneck is below bdev_rbd entirely (librbd → EC commit).
   `/var/lib/kubelet/kubeadm-flags.env` (deprecated in kubelet 1.35);
   fix is one-time but easy to trip on.
 - **SPDK CPU pinning.** Not configured here; both gateway pods get
-  a generous `cpu: 2` limit. If you start using nvmeof for real
-  load, look at SPDK reactor pinning + Kubernetes static CPU manager.
-- **Image is upstream-as-is.** Cluster compat works because Ceph
-  20.1.1↔20.2.1 librbd ABI is stable. If we ever bump to a Ceph
-  major (21.x), revisit — likely needs a custom build.
-- **`build-image.sh` is currently a placeholder.** It does a retag
-  of the upstream image; the "build from host SPDK + librbd"
-  approach is in the commit history but was abandoned after the
-  libstdc++/libgcc/glibc ABI cascade (it required overlaying glibc
-  itself, which would break the container's own binaries).
+  a `cpu: 2 / 4` request/limit (matches `--lcores 0-3`). Going below
+  4 cores throttles SPDK's reactor poll loop and tanks read IOPS —
+  see the "translation" section above. For real load, look at SPDK
+  reactor pinning + Kubernetes static CPU manager.
+- **Image is locally built from host artifacts** (`build-image.sh`)
+  with no upstream container in the lineage. The trade-off is
+  hand-managed dep closure: when the host's `librbd` / `libstdc++` /
+  `libgrpc` move (e.g. emerge of `sys-cluster/ceph-999` or
+  `sys-devel/gcc`), rebuild and push a new tag. The build pulls only
+  three external things at build time: the SPDK source pin, the
+  ceph-nvmeof 1.6.14 source for the Python control plane, and
+  whatever Python wheels pip resolves for the runtime deps.
+- **Upstream `quay.io/ceph/nvmeof-cli:1.6.14` is still used for the
+  one-shot CLI pods** (`setup-volume.sh`, manual `cli`). It's a
+  transient helper container that just sends gRPC to the gateway —
+  no ABI ties to our cluster. Replace if it ever drifts.
 
 ## TODO
 
-- Promote `nvmeof-cli` invocations from this README into a
-  `setup-subsystem.sh` script (mirrors `rgw-gateway/setup-instance.sh`).
 - Add a Grafana dashboard panel for SPDK + NVMeofGwMon stats.
 - Consider mTLS on the gRPC control plane (currently
   `enable_auth = False`).
-- Wire image-update-automation when the upstream `quay.io/ceph/nvmeof`
-  tag bumps.
-- Either commit a real `build-image.sh` (e.g. gentoo-stage3-based
-  with sys-cluster/ceph + dev-libs/spdk pre-installed), or formally
-  drop it and document that we track upstream.
 - Send the assert relaxation upstream as a tracker + PR.
+- Wire a rebuild trigger when `sys-cluster/ceph-999` re-emerges
+  (right now `build-image.sh` is run by hand after a host rebuild).
+- OpenTelemetry instrumentation in `bdev_rbd.c` (gateway-side spans
+  exported to tempo; first cut is gateway-only, full end-to-end
+  needs a `traceparent` hook in librbd).
