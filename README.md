@@ -107,6 +107,9 @@ deploy/
 └── kustomization.yaml               flux entry point
 
 setup-group.sh                       idempotent: pools + cephx + `ceph nvme-gw create`
+setup-volume.sh                      idempotent: rbd image + subsystem + namespace +
+                                       listeners + host allow — single command to provision
+                                       a new RBD-backed NVMe-oF volume (see walkthrough below)
 build-image.sh                       (currently a thin retag of quay.io/ceph/nvmeof:1.6.14)
 
 flux/
@@ -398,6 +401,19 @@ Listening sockets on sm3 (both gateways serving in parallel):
 
 A full walk-through, carving and exposing a new image and attaching it
 from a fresh client. Substitute names freely.
+
+For the cluster-side half, `setup-volume.sh` wraps steps 1–2 in a
+single idempotent command:
+
+```sh
+./setup-volume.sh -i workload-01 -s 100G
+# or restricted to a specific initiator NQN:
+./setup-volume.sh -i secure -s 50G \
+    -h nqn.2014-08.org.nvmexpress:uuid:11111111-2222-3333-4444-555555555555
+```
+
+The longer-form steps below are what the script does, useful for
+debugging or when you want to mutate one step in isolation.
 
 ### Sizing decision (briefly)
 
