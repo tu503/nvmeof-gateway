@@ -693,6 +693,31 @@ ceph nvme-gw delete gw-a nvmeof rbd-default
 ceph nvme-gw create gw-a nvmeof rbd-default
 ```
 
+### Rolling-restart endurance (observed)
+
+The single-pod-kill above is the unit test. The actual endurance
+case is the tuning loop: during the `max_io_qpairs_per_ctrlr` /
+`cpu` limit sweeps below, both gateways were rolled **multiple
+times each in a single afternoon** — configmap apply, `kubectl
+rollout restart deployment/nvmeof-gw-a`, wait, then the same on
+`nvmeof-gw-b`. Throughout:
+
+- `/dev/nvme4n1` (the loadtest volume) and `/dev/nvme0n2` (the
+  demo volume) stayed mounted and writable on the initiator.
+- `fio` runs spanning restart windows showed transient latency
+  bumps on the one-path interval but no I/O errors and no stuck
+  controllers.
+- `nvme list-subsys` would show one path in `connecting` for ~10s
+  while the restarted gateway came back; multipath picked it up
+  cleanly once the SPDK reactor finished initializing.
+
+The rule that keeps this working: **never restart both gateways at
+the same time.** A `Recreate`
+strategy on a single Deployment is fine; doing `kubectl rollout
+restart` on both Deployments back-to-back collapses ANA to zero
+optimized paths during the gap and the initiator's in-flight I/O
+times out.
+
 </details>
 
 <details>
@@ -703,68 +728,73 @@ ceph nvme-gw create gw-a nvmeof rbd-default
 </summary>
 
 
-Same RBD image (`nvmeof/workload-02`, 100 GiB, xfs), same host, same
-fio job file — only the transport differs. Run on `sm3`, which
-doubles as gateway host and initiator (loopback, no NIC hop), so
-this isolates the SPDK gateway cost from any real network cost.
+Two RBD images carved identically in the same pool (one driven via
+NVMe-oF/TCP, the other via krbd directly), same host, same
+fio sweep — only the transport differs. Run on `sm3`, which doubles
+as gateway host and initiator (loopback, no NIC hop), so this
+isolates the SPDK gateway cost from any real network cost.
 
-Backend A: xfs over `nvme-tcp` to both gateways (`:4420` + `:4421`,
-ANA multipath via `nvme-subsys1`).
-Backend B: xfs over `krbd` (`rbd map nvmeof/workload-02` → `/dev/rbd3`).
-Between runs: `umount` → `nvme disconnect` → `rbd map` → remount,
-then the reverse to restore. `fio-compare.sh` in this repo runs the
-same comparison in a single pass (raw devices, no fs).
+Backend A (`nvmeof`): raw `/dev/nvme4n1`, two-path ANA multipath
+(`sm3:4420` + `sm3:4421`) backed by `nvmeof/loadtest`.
+Backend B (`krbd`): raw `/dev/rbd2`, `rbd map nvmeof/loadtest-direct`.
+Both images: 10 GiB, `--data-pool nvmeof-data` (EC k=6 m=3),
+features `layering,exclusive-lock,object-map,fast-diff,deep-flatten,data-pool`.
 
-Job file (`/tmp/fio-baseline.ini`):
+`fio-compare.sh` in this repo runs the sweep in a single pass —
+serial, never concurrent across legs (so the two backends never
+contend for the same OSDs at once). Each leg = 5 s ramp + 30 s
+timed. ioengine=`io_uring` (libaio module is absent on this
+kernel), `--direct=1`, prefilled to make EC parity real.
 
-```ini
-[global]
-ioengine=libaio
-direct=1
-group_reporting=1
-runtime=30
-time_based=1
-ramp_time=2
-filename=/mnt/workload-02/fio-test.bin
-size=4G
-refill_buffers=1
+Configuration:
 
-[seq-write-1M] stonewall ; rw=write     ; bs=1M ; iodepth=8
-[seq-read-1M]  stonewall ; rw=read      ; bs=1M ; iodepth=8
-[rand-write-4k]stonewall ; rw=randwrite ; bs=4k ; iodepth=32
-[rand-read-4k] stonewall ; rw=randread  ; bs=4k ; iodepth=32
-```
+| Knob | Value | Why |
+|---|---|---|
+| pod `resources.limits.cpu` | 4 | matches SPDK `--lcores 0-3` |
+| pod `resources.requests.cpu` | 2 | k8s scheduling floor |
+| `transport_tcp_options.max_io_qpairs_per_ctrlr` | 16 | tested 7/16/32; 16 is the sweet spot |
+| nvme-tcp queue_count negotiated | 17 (16 io + 1 admin) | per controller, from initiator |
+| fio `iodepth` × `numjobs` | 32 × 4 (4k workloads); 16 × 1 (64k seq) | |
 
-Results (`sync && echo 3 > /proc/sys/vm/drop_caches` before each run):
+Results:
 
-| Test                       | NVMe-oF (nvme-tcp ×2)        | Direct krbd                 | Δ                  |
-|----------------------------|------------------------------|-----------------------------|--------------------|
-| seq write  1M, iod=8       | 38.5 MiB/s · 38 IOPS · 208 ms | 38.4 MiB/s · 38 IOPS · 208 ms | tie                |
-| seq read   1M, iod=8       | 27.9 MiB/s · 27 IOPS · 288 ms | 108  MiB/s · 107 IOPS · 74 ms | **3.87× krbd**     |
-| rand write 4k, iod=32      | 403 KiB/s · 99 IOPS · 326 ms  | 356 KiB/s · 87 IOPS · 362 ms  | tie (within noise) |
-| rand read  4k, iod=32      | 6.6 MiB/s · 1691 IOPS · 20.6 ms | 10.7 MiB/s · 2730 IOPS · 11.7 ms | **1.62× krbd**     |
+| Workload                       | NVMe-oF                              | krbd-direct                          | Δ                       |
+|--------------------------------|--------------------------------------|--------------------------------------|-------------------------|
+| 4k randread, iod=32 ×4j        | 740 IOPS · 2.9 MiB/s · 176 ms · p99 1036 ms  | 937 IOPS · 3.7 MiB/s · 137 ms · p99 1002 ms  | krbd +27%               |
+| 4k randwrite, iod=32 ×4j       | 129 IOPS · 0.5 MiB/s · 986 ms · p99 3674 ms  | 162 IOPS · 0.6 MiB/s · 785 ms · p99 2433 ms  | krbd +26%               |
+| 4k randrw 70/30, iod=32 ×4j    | r=291 / w=129 IOPS · 208/516 ms     | r=334 / w=148 IOPS · 185/442 ms     | krbd +15% r / +15% w    |
+| 64k seqread, iod=16 ×1j        | 340 IOPS · 21.3 MiB/s · 47 ms · p99 202 ms   | 570 IOPS · 35.7 MiB/s · 28 ms · p99 77 ms    | krbd +68%               |
+| **64k seqwrite, iod=16 ×1j**   | **619 IOPS · 38.7 MiB/s · 26 ms · p99 73 ms**| 495 IOPS · 31.0 MiB/s · 32 ms · p99 78 ms    | **NVMe-oF +25%**        |
 
 Takeaways:
 
-- **Writes are transport-independent.** Both paths bottleneck on
-  RADOS replication into the EC `nvmeof-data` pool; the SPDK gateway
-  adds no measurable write overhead on this cluster (write IOPS,
-  bandwidth and avg latency all match within run-to-run noise).
-- **Reads pay a real gateway tax.** Sequential reads are ~3.9×
-  slower over `nvme-tcp` and random reads ~1.6× slower. krbd issues
-  parallel librados ops and benefits from kernel read-ahead; the
-  SPDK reactor's per-namespace serialization is the apparent
-  ceiling.
+- **NVMe-oF beats krbd on sequential writes.** SPDK's bdev_rbd
+  coalesces 64k writes into librbd better than krbd's per-bio path
+  — same EC commit underneath, different submit pattern above.
+- **Reads pay a real gateway tax.** Random reads are 27% slower
+  over `nvme-tcp` and sequential reads 68% slower. The TCP socket
+  hop + the per-IO cross-thread `spdk_thread_send_msg` from librbd
+  back to the SPDK reactor add up most when the workload is read-
+  dominated and small-blocky.
+- **Random writes are gateway-neutral within noise** (~20% spread
+  is normal run-to-run for EC k=6+3 on this cluster). Bottleneck is
+  below bdev_rbd: librbd → 9 OSD parity commit. Hard floor.
+- **Tuning history** for the NVMe-oF leg's random read:
+    - Baseline (cpu=2, qpair=7): **328 IOPS**
+    - cpu=4 (matching `--lcores 0-3`), qpair=7: 465 IOPS (+42%)
+    - cpu=4, qpair=32: 620 IOPS (+89%) but seq workloads broke
+      during a concurrent scrub
+    - **cpu=4, qpair=16 (this row): 740 IOPS** (+125%) with sequential
+      perf restored. Kept.
 - **Same-host caveat.** Both runs are loopback. A remote initiator
-  over a real NIC would add `nvme-tcp` framing/TCP cost to backend
-  A only, widening the read gap further — but giving NVMe-oF its
-  actual advantage: zero Ceph software on the client.
+  over a real NIC would add `nvme-tcp` framing/TCP cost to NVMe-oF
+  only, widening read gaps further — but that's the price for the
+  NVMe-oF win: zero Ceph software on the client.
 - **Absolute numbers are homelab-scale** (one EC k=6+3 pool on one
-  host, parallel `emerge` not necessarily quiesced). The ratio is
-  the portable finding; the magnitudes are not.
+  host). The ratio is the portable finding; the magnitudes aren't.
 
-Raw fio output preserved under `/tmp/fio-results/{nvmeof,krbd}.txt`
-on `sm3` for cross-checking.
+Raw fio JSON preserved under `/tmp/fio-compare/` on sm3 for
+cross-checking.
 
 </details>
 
