@@ -68,3 +68,7 @@ data:
     # Cluster allocator strategy — required by gateway server; pick the
     # default "cluster pool" mode that ceph-nvmeof.conf.example documents.
     cluster_connections = 32
+    # We built SPDK without --with-idxd (DSA accelerator) since the
+    # homelab hosts don't have DSA hardware anyway. Tell ceph-nvmeof
+    # not to probe for it on startup.
+    enable_dsa_acceleration = False
